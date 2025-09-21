@@ -43,22 +43,20 @@ class Socks5Proxy:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.bind((self.host, self.port))
         sock.listen()
-        print(f"SOCKS5 proxy listening on {self.host}:{self.port}...")
         try:
             while True:
                 client_socket, client_addr = sock.accept()
                 client_ip = client_addr[0]
                 if(is_blocked(client_socket, client_ip)):
                     continue
-                threading.Thread(target=self.proxy, args=(client_socket, client_addr), daemon=True).start()
+                threading.Thread(target=self.proxy, args=(client_socket,), daemon=True).start()
         except KeyboardInterrupt:
             print("Shutting down...")
         finally:
             try: sock.close()
             except: pass
 
-    def proxy(self, client_socket: socket.socket, addr):
-        print("Hello World!")
+    def proxy(self, client_socket: socket.socket):
         try:
             # STEP 1: VER, AUTHENTICATION METHODS
             ver, nmethods = read_bytes(client_socket, 2)
@@ -76,8 +74,8 @@ class Socks5Proxy:
             ver, cmd, _, atyp = read_bytes(client_socket, 4)
             # cmd limited to connect x'01'
             if ver != 0x05 or cmd != 0x01:
+                client_socket.sendall(self.construct_req_reply(0x05))
                 client_socket.close()
-                client_socket.sendall(self.construct_req_reply(5))
                 return
             # address type: IPV4
             if atyp == 0x01:
@@ -89,7 +87,8 @@ class Socks5Proxy:
                 dst_addr_bytes = read_bytes(client_socket, len)
                 dst_addr = dst_addr_bytes.decode("ascii")
             else:
-                client_socket.sendall(self.construct_req_reply(5))
+                client_socket.sendall(self.construct_req_reply(0x05))
+                return
 
             dst_port_bytes = read_bytes(client_socket, 2)
             dst_port = int.from_bytes(dst_port_bytes,"big")
@@ -97,15 +96,14 @@ class Socks5Proxy:
             # STEP 3: REMOTE CONNECT
             remote_socket = None
             try:
-                print(f"CONNECTED! {dst_addr}:{dst_port}")
                 remote_socket = socket.create_connection((dst_addr, dst_port))
             except Exception:
-                client_socket.sendall(self.construct_req_reply(5))
+                client_socket.sendall(self.construct_req_reply(0x05))
                 return
             
             # STEP 4: CONNECT REPLY
             bnd_addr, bnd_port = remote_socket.getsockname()
-            client_socket.sendall(self.construct_req_reply(0, bnd_addr, bnd_port))
+            client_socket.sendall(self.construct_req_reply(0x00, bnd_addr, bnd_port))
 
             # STEP 5: RELAY PROCESSING
             self.relay(client_socket, remote_socket)
@@ -129,15 +127,10 @@ class Socks5Proxy:
         return pkt
     
     def relay(self, client_socket, remote_socket):
-        sockets = [client_socket, remote_socket]
-        while sockets:
-            readable, _, _ = select.select(sockets, [], [])
+        while True:
+            readable, _, _ = select.select([client_socket, remote_socket], [], [])
             for sock in readable:
-                try:
-                    data = sock.recv(4096)
-                except ConnectionResetError:
-                    data = b''
-
+                data = sock.recv(4096)
                 if data:
                     if sock is client_socket:
                         remote_socket.sendall(data)
@@ -145,13 +138,6 @@ class Socks5Proxy:
                     else:
                         client_socket.sendall(data)
                         print(f"Remote -> Client {len(data)} bytes")
-                else:
-                    # this side closed; shut down the other direction
-                    if sock is client_socket:
-                        remote_socket.shutdown(socket.SHUT_WR)
-                    else:
-                        client_socket.shutdown(socket.SHUT_WR)
-                    sockets.remove(sock)
-
+                
 if __name__ == "__main__":
     Socks5Proxy().start()
