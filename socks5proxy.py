@@ -25,7 +25,6 @@ def is_blocked(client_socket : socket.socket, ip : str) -> bool:
     return False
 
 def read_bytes(client_socket : socket.socket, n : int) -> bytes:
-    """Reads exactly n bytes from stream and returns bytes"""
     buffer = bytearray()
     while(len(buffer) < n):
         byte = client_socket.recv(n-len(buffer))
@@ -40,11 +39,11 @@ class Socks5Proxy:
         self.port = port
 
     def start(self):
-        """use IPv4 and TCP for socket"""
+        # IPv4 and TCP socket
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.bind((self.host, self.port))
         sock.listen()
-        print(f"SOCKS5 listening on {self.host}:{self.port}")
+        print(f"SOCKS5 proxy listening on {self.host}:{self.port}...")
         try:
             while True:
                 client_socket, client_addr = sock.accept()
@@ -52,11 +51,107 @@ class Socks5Proxy:
                 if(is_blocked(client_socket, client_ip)):
                     continue
                 threading.Thread(target=self.proxy, args=(client_socket, client_addr), daemon=True).start()
+        except KeyboardInterrupt:
+            print("Shutting down...")
         finally:
-            sock.close
+            try: sock.close()
+            except: pass
 
     def proxy(self, client_socket: socket.socket, addr):
         print("Hello World!")
+        try:
+            # STEP 1: VER, AUTHENTICATION METHODS
+            ver, nmethods = read_bytes(client_socket, 2)
+            # only version 5 should be supported
+            if ver != 0x05:
+                client_socket.close()
+                raise ConnectionError("version not supported.")
+            methods = read_bytes(client_socket, nmethods)
+            # only need to support "no authentication"
+            if 0x00 not in methods:
+                raise ConnectionError("authentication method not supported.")
+            client_socket.sendall(b"\x05\x00")
+
+            # STEP 2: CONNECT REQUEST
+            ver, cmd, _, atyp = read_bytes(client_socket, 4)
+            # cmd limited to connect x'01'
+            if ver != 0x05 or cmd != 0x01:
+                client_socket.close()
+                client_socket.sendall(self.construct_req_reply(5))
+                return
+            # address type: IPV4
+            if atyp == 0x01:
+                dst_addr_bytes = read_bytes(client_socket, 4)
+                dst_addr = socket.inet_ntoa(dst_addr_bytes)
+            # address type: domain name
+            elif atyp == 0x03:
+                len, = read_bytes(client_socket, 1)
+                dst_addr_bytes = read_bytes(client_socket, len)
+                dst_addr = dst_addr_bytes.decode("ascii")
+            else:
+                client_socket.sendall(self.construct_req_reply(5))
+
+            dst_port_bytes = read_bytes(client_socket, 2)
+            dst_port = int.from_bytes(dst_port_bytes,"big")
+
+            # STEP 3: REMOTE CONNECT
+            remote_socket = None
+            try:
+                print(f"CONNECTED! {dst_addr}:{dst_port}")
+                remote_socket = socket.create_connection((dst_addr, dst_port))
+            except Exception:
+                client_socket.sendall(self.construct_req_reply(5))
+                return
+            
+            # STEP 4: CONNECT REPLY
+            bnd_addr, bnd_port = remote_socket.getsockname()
+            client_socket.sendall(self.construct_req_reply(0, bnd_addr, bnd_port))
+
+            # STEP 5: RELAY PROCESSING
+            self.relay(client_socket, remote_socket)
+            
+        except Exception:
+            pass
+        finally:
+            try: client_socket.close()
+            except: pass
+            if remote_socket:
+                try: remote_socket.close()
+                except: pass
+
+    def construct_req_reply(self, rep: int, bnd_addr: str = "0.0.0.0", bnd_port: int = 0):
+        ver = b"\x05"
+        rsv = b"\x00"
+        atyp = b"\x01"
+        bnd_addr_bytes = socket.inet_aton(bnd_addr)
+        bnd_port_bytes = bnd_port.to_bytes(2,"big")
+        pkt = ver+rep.to_bytes(1,"big")+rsv+atyp+bnd_addr_bytes+bnd_port_bytes
+        return pkt
+    
+    def relay(self, client_socket, remote_socket):
+        sockets = [client_socket, remote_socket]
+        while sockets:
+            readable, _, _ = select.select(sockets, [], [])
+            for sock in readable:
+                try:
+                    data = sock.recv(4096)
+                except ConnectionResetError:
+                    data = b''
+
+                if data:
+                    if sock is client_socket:
+                        remote_socket.sendall(data)
+                        print(f"Client -> Remote {len(data)} bytes")
+                    else:
+                        client_socket.sendall(data)
+                        print(f"Remote -> Client {len(data)} bytes")
+                else:
+                    # this side closed; shut down the other direction
+                    if sock is client_socket:
+                        remote_socket.shutdown(socket.SHUT_WR)
+                    else:
+                        client_socket.shutdown(socket.SHUT_WR)
+                    sockets.remove(sock)
 
 if __name__ == "__main__":
     Socks5Proxy().start()
